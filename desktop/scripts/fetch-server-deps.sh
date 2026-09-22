@@ -170,9 +170,9 @@ case "${uname_s}" in
     else
       # Pinned zhongfly release. Baseline x86-64 build (NOT the -v3/AVX2 build) for broad CPU
       # compatibility. The checksum is verified on the downloaded bytes.
-      MPV_WIN_TAG="2026-06-19-2d5dfb343a"
-      MPV_WIN_ASSET="mpv-x86_64-20260619-git-2d5dfb343a.7z"
-      MPV_WIN_SHA256="eaa0479b67270b5a1d3f0c6d9a5b6b5749322e5e8848bba544b921669d5d207a"
+      MPV_WIN_TAG="2026-09-21-e76a35ec95"
+      MPV_WIN_ASSET="mpv-x86_64-20260921-git-e76a35ec95.7z"
+      MPV_WIN_SHA256="77e7eee765b0883a2b6cfec2357e3bac981ac0352d6607f02d9218c48d42329d"
       MPV_WIN_URL="https://github.com/zhongfly/mpv-winbuild/releases/download/${MPV_WIN_TAG}/${MPV_WIN_ASSET}"
       echo "fetch-server-deps: downloading mpv (zhongfly ${MPV_WIN_TAG})..."
       TMP_MPV="$(mktemp -d)"
