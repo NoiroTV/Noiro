@@ -1,0 +1,76 @@
+name: Build Android APK
+
+# CI-first Android build. Android cannot be built on the macOS dev machine (no SDK/JDK), so this
+# workflow is the build feedback loop: it builds the debug APK and uploads it as an artifact.
+# The shared engine (stremio-core-kotlin), the libmpv player, and the Compose UI matching tvOS/iOS
+# are added incrementally on top of this verified skeleton.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "8.9"
+
+      # The Compose app links libstremiox_core.so, cross-compiled from core/ by the gradle
+      # cargoNdkBuild task (`cargo ndk -t arm64-v8a -t x86_64 -p 26 ... build --release`). That
+      # needs: the NDK pinned in app/build.gradle.kts (ndkVersion), Rust nightly with the Android
+      # targets (core/ pins nightly via rust-toolchain.toml; the android targets are tier-2, so no
+      # build-std), and the cargo-ndk subcommand. Without these the task fails with
+      # "error: no such command: ndk" / a missing NDK.
+      - name: Install Android NDK (must match ndkVersion in app/build.gradle.kts)
+        run: |
+          yes | sdkmanager "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install Rust nightly + Android targets
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+          components: rust-src
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "core -> target"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version "^3" --locked
+
+      - name: Build debug APK
+        working-directory: android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      # assembleDebug builds every flavor, and the full/play flavor split moved the outputs from
+      # apk/debug/ to apk/<flavor>/debug/ -- glob both so the artifact carries the sideload `full`
+      # APK and the `play` APK. error (not warn) so a path drift fails the job instead of silently
+      # uploading nothing.
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Noiro-Android-debug
+          path: android/app/build/outputs/apk/*/debug/*.apk
+          if-no-files-found: error

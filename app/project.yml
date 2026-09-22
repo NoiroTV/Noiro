@@ -1,0 +1,386 @@
+name: Noiro
+options:
+  bundleIdPrefix: com.elvissalihovic.noiro
+  developmentLanguage: en
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  # Full localization roster shipped by the single Resources/Localizable.xcstrings String Catalog.
+  # The catalog compiler emits an .lproj for every localization in the catalog regardless of this list,
+  # but declaring knownRegions keeps Xcode's project state, the AppleLanguages override (AppLanguage.set),
+  # and Foundation's bundle localization resolution is aware of every code so each pinned language resolves
+  # to its real .lproj at runtime. 0.3.9 expanded this from 64 to 106 languages (+ Base) past 100.
+  knownRegions:
+    - Base
+    - en
+    - af
+    - am
+    - ar
+    - as
+    - az
+    - be
+    - bg
+    - bn
+    - br
+    - bs
+    - ca
+    - ceb
+    - cs
+    - cy
+    - da
+    - de
+    - el
+    - es
+    - et
+    - eu
+    - fa
+    - fi
+    - fil
+    - fo
+    - fr
+    - fy
+    - ga
+    - gd
+    - gl
+    - gu
+    - ha
+    - he
+    - hi
+    - hr
+    - ht
+    - hu
+    - hy
+    - id
+    - ig
+    - is
+    - it
+    - ja
+    - jv
+    - ka
+    - kk
+    - km
+    - kn
+    - ko
+    - ku
+    - ky
+    - lb
+    - lo
+    - lt
+    - lv
+    - mg
+    - mi
+    - mk
+    - ml
+    - mn
+    - mr
+    - ms
+    - mt
+    - my
+    - nb
+    - ne
+    - nl
+    - ny
+    - oc
+    - or
+    - pa
+    - pl
+    - ps
+    - pt-BR
+    - pt-PT
+    - ro
+    - ru
+    - rw
+    - sd
+    - si
+    - sk
+    - sl
+    - sm
+    - sn
+    - so
+    - sq
+    - sr
+    - st
+    - su
+    - sv
+    - sw
+    - ta
+    - te
+    - tg
+    - th
+    - tr
+    - tt
+    - ug
+    - uk
+    - ur
+    - uz
+    - vi
+    - xh
+    - yo
+    - zh-Hans
+    - zh-Hant
+    - zu
+packages:
+  MPVKit:
+    url: https://github.com/mpvkit/MPVKit
+    exactVersion: "0.41.0-n8.1.2"   # n8.1.2 includes MPVKit PR #73 (avfoundation AO built for tvOS) - the #78/#101 Atmos/eARC fix
+  KSPlayer:
+    # Compact Vortexo-tested source, adapted to share MPVKit-GPL's existing FFmpeg binaries.
+    path: Packages/KSPlayer
+targets:
+  # Native iPhone/iPad client on stremio-core + libmpv (0.3.0), the same engine + player as the
+  # Apple TV app, with a touch UI in SourcesiOS. Replaces the compatibility web-host target once it
+  # reaches parity (see docs/REBASE-iOS.md). Built alongside it so the web host keeps working
+  # until cutover. Mirrors the proven tvOS native target's settings.
+  Noiro:
+    type: application
+    platform: iOS
+    # Raise the per-app jetsam ceiling so the in-process node server + mpv 4K buffers don't trip the
+    # memory limit (the device server-death). This vendor capability is not part
+    # of the reduced Personal Team configuration documented in docs/INSTALLATION.md.
+    entitlements:
+      path: Noiro.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
+        com.apple.security.application-groups:
+          - group.com.elvissalihovic.noiro
+    sources:
+      - SourcesiOS # touch UI
+      - SourcesShared # shared engine bridge, models, account, ranking, profiles, themes
+      - Sources/Player # libmpv player core (shared with tvOS)
+      - Sources/NodeServer.swift # embedded streaming server
+      - Sources/PlayerScreen.swift # full native touch player (controls, tracks, resume), reused by the native UI
+      - Sources/ShareSheet.swift # share sheet used by the player handoff
+      - Sources/ExternalPlayer.swift # external-player handoff used by the player
+      - Resources/Assets.xcassets
+      # Localization: a single String Catalog (en source + per-language translations) shared by every
+      # native target. SwiftUI Text/Label/Button string literals localize from it automatically.
+      - Resources/Localizable.xcstrings
+      - path: Resources/server.js
+        optional: true
+        buildPhase: resources
+      - path: Resources/fonts
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Bundled Anime4K glsl shaders (MIT), loaded by the libmpv player's Anime4K upscaling preset.
+      # Folder reference so the .glsl files land under a `shaders/` subdir, resolved at runtime from
+      # Bundle.main (see MPVMetalViewController.anime4kShaderPaths).
+      - path: Resources/shaders
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Bundled real streaming-brand logos (transparent PNGs), rendered by the Streaming Services tiles
+      # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
+      # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
+      - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # The full release changelog, bundled so Settings > What's New renders the whole history from the
+      # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
+      - path: ../CHANGELOG.md
+        group: Noiro
+        buildPhase: resources
+    dependencies:
+      - package: MPVKit
+        product: MPVKit-GPL
+      - framework: Vendor/nodejs-mobile/NodeMobile.xcframework
+        embed: true
+        codeSign: true
+      # The Rust stremio-core engine (staticlib xcframework, iOS slices), linked, not embedded.
+      - framework: Vendor/StremioXCore.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.elvissalihovic.noiro
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/Noiro-Bridging.h
+        MARKETING_VERSION: "0.3.13"
+        CURRENT_PROJECT_VERSION: "174"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: NoiroIcon
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_FILE: Resources/Info-iOS.plist
+        INFOPLIST_KEY_CFBundleDisplayName: Noiro
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
+        INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleLightContent
+        CODE_SIGNING_ALLOWED: "YES"
+        CODE_SIGNING_REQUIRED: "NO"
+  # Native macOS app (NOT Catalyst, which MPVKit can't link). Reuses the same native SwiftUI UI
+  # (SourcesiOS), shared engine, and the now-cross-platform libmpv player. Streaming server:
+  # nodejs-mobile has no macOS slice, so instead of embedding node as a library (iOS/tvOS), the Mac
+  # bundles a standalone `node` binary (Resources/node-darwin-arm64, fetched by the pre-build script)
+  # and spawns server.js in a child process (SourcesShared/MacNodeServer.swift). This restores TORRENT
+  # playback on the Mac; it is no longer Direct-Links-Only. MPVKit's macos-arm64 slices and the
+  # stremio-core macOS slice are complete.
+  NoiroMac:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0" # MPVKit's macOS slices (Libuavs3d) require macOS 14
+    entitlements:
+      path: NoiroMac.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.elvissalihovic.noiro
+    sources:
+      - SourcesiOS # the native SwiftUI UI also runs on macOS
+      - SourcesShared # includes MacNodeServer.swift (the child-process node server)
+      - Sources/Player
+      - Sources/PlayerScreen.swift
+      - Sources/ShareSheet.swift
+      - Sources/ExternalPlayer.swift
+      - Resources/Assets.xcassets
+      - Resources/Localizable.xcstrings # shared String Catalog (en + translations)
+      - path: Resources/server.js # Stremio streaming server, run by the bundled node binary
+        optional: true
+        buildPhase: resources
+      - path: Resources/node-darwin-arm64 # standalone node executable (fetched pre-build)
+        optional: true
+        buildPhase: resources
+      - path: Resources/fonts
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Bundled Anime4K glsl shaders (MIT), loaded by the libmpv player's Anime4K upscaling preset.
+      # Folder reference so the .glsl files land under a `shaders/` subdir, resolved at runtime from
+      # Bundle.main (see MPVMetalViewController.anime4kShaderPaths).
+      - path: Resources/shaders
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Bundled real streaming-brand logos (transparent PNGs), rendered by the Streaming Services tiles
+      # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
+      # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
+      - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # The full release changelog, bundled so Settings > What's New renders the whole history from the
+      # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
+      - path: ../CHANGELOG.md
+        group: Noiro
+        buildPhase: resources
+    dependencies:
+      - package: MPVKit
+        product: MPVKit-GPL # macos-arm64_x86_64 slice
+      - framework: Vendor/StremioXCore.xcframework
+        embed: false # now carries an aarch64-apple-darwin slice
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.elvissalihovic.noiro.macos
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/Noiro-Bridging.h
+        MARKETING_VERSION: "0.3.13"
+        CURRENT_PROJECT_VERSION: "174"
+        ASSETCATALOG_COMPILER_APPICON_NAME: NoiroIcon
+        GENERATE_INFOPLIST_FILE: "YES"
+        # Base plist (merged under the generated keys) carrying the ATS arbitrary-loads exception +
+        # the local-network usage string, so a plain-http custom server (Tailscale / LAN) connects on
+        # macOS the same way it does on iOS/tvOS. Mac was the only target shipping default ATS (issue #58).
+        INFOPLIST_FILE: Resources/Info-macOS.plist
+        INFOPLIST_KEY_CFBundleDisplayName: Noiro
+        # Name the product "Noiro" so the .app, executable, generated bundle
+        # name, menu bar, Dock, Finder, and installed app all use one identity.
+        PRODUCT_NAME: Noiro
+        CODE_SIGNING_ALLOWED: "YES"
+        CODE_SIGNING_REQUIRED: "NO"
+  # tvOS has NO WebKit, so this is a native client (SwiftUI + addon HTTP + libmpv),
+  # NOT the iOS web-host app. It shares only the MPVKit player core (Sources/Player).
+  NoiroTV:
+    type: application
+    platform: tvOS
+    entitlements:
+      path: NoiroTV.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
+        com.apple.security.application-groups:
+          - group.com.elvissalihovic.noiro
+    sources:
+      - SourcesTV
+      - SourcesShared # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      - Sources/Player
+      - Sources/NodeServer.swift
+      - ResourcesTV/Assets.xcassets
+      - Resources/Localizable.xcstrings # shared String Catalog (en + translations)
+      - path: Resources/server.js
+        optional: true
+        buildPhase: resources
+      - path: Resources/fonts
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Bundled Anime4K glsl shaders (MIT), loaded by the libmpv player's Anime4K upscaling preset.
+      # Folder reference so the .glsl files land under a `shaders/` subdir, resolved at runtime from
+      # Bundle.main (see MPVMetalViewController.anime4kShaderPaths).
+      - path: Resources/shaders
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Bundled real streaming-brand logos (transparent PNGs), rendered by the Streaming Services tiles
+      # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
+      # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
+      - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # The full release changelog, bundled so Settings > What's New renders the whole history from the
+      # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
+      - path: ../CHANGELOG.md
+        group: Noiro
+        buildPhase: resources
+    dependencies:
+      - package: MPVKit
+        product: MPVKit-GPL
+      - package: KSPlayer
+        product: KSPlayer
+      - framework: Vendor/nodejs-mobile/NodeMobile.xcframework
+        embed: true
+        codeSign: true
+      # The Rust stremio-core engine (staticlib xcframework), linked, not embedded.
+      - framework: Vendor/StremioXCore.xcframework
+        embed: false
+      # AVKit must be an explicit link: the only thing used from it is the
+      # UIWindow.avDisplayManager CATEGORY (no link-time symbols), so autolink
+      # plus the dead-stripping linker silently dropped the framework, the
+      # category never loaded at runtime, and every avDisplayManager access
+      # aborted with an unrecognized selector (sim AND device, 2026-06-10).
+      - sdk: AVKit.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.elvissalihovic.noiro.tvos
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/Noiro-Bridging.h
+        MARKETING_VERSION: "0.3.13"
+        CURRENT_PROJECT_VERSION: "174"
+        ASSETCATALOG_COMPILER_APPICON_NAME: "Noiro App Icon & Top Shelf Image"
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES" # explicit UIScene adoption (tvOS 26 compliance)
+        INFOPLIST_KEY_CFBundleDisplayName: Noiro
+        CODE_SIGNING_ALLOWED: "YES"
+        CODE_SIGNING_REQUIRED: "NO"
+schemes:
+  Noiro:
+    build:
+      targets:
+        Noiro: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  NoiroMac:
+    build:
+      targets:
+        NoiroMac: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  NoiroTV:
+    build:
+      targets:
+        NoiroTV: all
+    run:
+      config: Debug
+      commandLineArguments:
+        "-stremiox-no-update-check": true
+    archive:
+      config: Release

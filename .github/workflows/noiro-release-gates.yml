@@ -1,0 +1,39 @@
+name: Noiro release gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-gate:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Run static release boundary checks
+        run: scripts/noiro-release-gate.sh --static
+      - name: Generate locked Noiro project
+        run: scripts/generate-noiro-project.sh
+      - name: Verify required schemes
+        run: |
+          xcodebuild -project app/Noiro.xcodeproj -list | grep -q 'NoiroTV'
+          xcodebuild -project app/Noiro.xcodeproj -list | grep -q 'NoiroMac'
+
+  full-gate-remains-closed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prove an unapproved release cannot pass
+        run: |
+          if scripts/noiro-release-gate.sh; then
+            echo "Full release gate unexpectedly opened" >&2
+            exit 1
+          fi
+          echo "Full release gate correctly remains closed."

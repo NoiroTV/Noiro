@@ -1,0 +1,394 @@
+import Foundation
+
+/// Resolves a YouTube video id to directly-playable googlevideo URLs FROM THE USER'S OWN IP, with no server
+/// remux and no JS engine. This is the native Swift port of the trailer worker's proven no-nsig ladder
+/// (`noiro-trailer/src/yt_resolve.ts`): POST the public InnerTube `/player` endpoint as a set of app clients
+/// that return PLAIN progressive/adaptive URLs (no signatureCipher, no ciphered `n`), and only ever accept a
+/// format whose `url` is present directly. On a residential IP the IOS/ANDROID clients return the full
+/// streamingData: muxed itag 22/18 AND adaptive 1080p+.
+///
+/// Modern trailers are ADAPTIVE-ONLY at EVERY height on the residential IOS client: the `/player` answer is
+/// playable OK with ZERO muxed formats (no itag 18/22) and a split video-only + audio-only set up to 1080p
+/// (verified live). libmpv plays that natively when the audio-only stream is handed over as an `--audio-file`
+/// sidecar, which is why `Resolved` carries an optional `audioURL`. So the resolver prefers a muxed format
+/// only WHEN the client actually exposes one, and otherwise returns the adaptive pair at whatever height is
+/// offered (it does NOT require the pair to be > 720). A pure-AVPlayer context that cannot take a sidecar can
+/// still pass `wantMuxedOnly: true` to get muxed-or-nil, but no shipping trailer/ambient caller does: they all
+/// play through mpv (the button mounts the audio sidecar, the muted ambient just renders the video-only leg).
+///
+/// FAIL-SOFT: any network / decode / playability error is a miss for that client and the ladder moves on;
+/// a fully-missed ladder returns nil. Never throws.
+///
+/// UPDATE-ON-BREAK: the client identity strings below (clientVersion / deviceModel / osVersion / userAgent)
+/// are copied verbatim from the worker's CLIENTS table, itself refreshed from yt-dlp's INNERTUBE_CLIENTS.
+/// YouTube rotates these; when trailers stop resolving, refresh BOTH here and in yt_resolve.ts together.
+enum YouTubeDirectResolver {
+
+    // MARK: - Public contract
+
+    /// A successful resolve. `videoURL` is either a muxed (audio included) progressive mp4 OR a video-only
+    /// adaptive stream; `audioURL` is non-nil ONLY in the adaptive case (feed it to mpv as `--audio-file`).
+    struct Resolved {
+        let videoURL: URL      // muxed (audio included) OR video-only adaptive
+        let audioURL: URL?     // non-nil ONLY when videoURL is video-only (mpv --audio-file sidecar)
+        let height: Int
+        let isMuxed: Bool
+    }
+
+    /// The User-Agent googlevideo REQUIRES for the URLs this resolver returns. googlevideo binds an issued
+    /// URL to the InnerTube client that minted it: replay it with a DIFFERENT UA (mpv's stock "Lavf/*", or
+    /// even the app's Safari-like default) and googlevideo answers 403, which surfaces in libmpv as
+    /// `endFileError reason=loading failed` and the "Trailer unavailable" overlay. Because the IOS client is
+    /// first in the ladder and answers on residential IPs, its UA is the one that matches the returned host;
+    /// the player MUST send this exact UA for both the video URL and the `--audio-file` sidecar. This is the
+    /// same string as `clients[0].ua` (the IOS entry), hoisted to a public constant the player can apply
+    /// without re-deriving the ladder. Keep it in lockstep with the IOS `Client.ua` below.
+    static let googlevideoUserAgent = "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+
+    /// Resolve `videoID` by walking the InnerTube client ladder (IOS -> ANDROID -> TVHTML5 embedded), returning
+    /// on the first client that yields a usable format. `maxHeight` caps the adaptive pick (default 1080).
+    /// `wantMuxedOnly`: a pure-AVPlayer context that cannot take an audio sidecar; the resolver then returns a
+    /// muxed format only (nil when the client exposed none). Default (false) returns muxed-when-present, else
+    /// the adaptive video+audio pair at any height.
+    static func resolve(videoID: String, maxHeight: Int = 1080, wantMuxedOnly: Bool = false) async -> Resolved? {
+        // Hero + trailer button double-resolve the same id within seconds; serve the second from cache.
+        let cacheKey = "\(videoID)|\(maxHeight)|\(wantMuxedOnly ? 1 : 0)"
+        if let hit = await cache.get(cacheKey) {
+            NSLog("[yt-direct] id=%@ client=%@ %@ h=%d", videoID, "cache", hit.isMuxed ? "muxed" : "adaptive", hit.height)
+            return hit
+        }
+
+        for client in clients {
+            guard let streaming = await fetchStreamingData(videoID: videoID, client: client) else { continue }
+
+            if let resolved = await pick(from: streaming,
+                                         maxHeight: maxHeight,
+                                         wantMuxedOnly: wantMuxedOnly,
+                                         userAgent: client.ua) {
+                await cache.set(cacheKey, resolved)
+                NSLog("[yt-direct] id=%@ client=%@ %@ h=%d",
+                      videoID, client.name, resolved.isMuxed ? "muxed" : "adaptive", resolved.height)
+                // Verbose probe: the exact video host, whether an audio sidecar rides along, and the UA the
+                // player MUST replay both legs with. If a reproduce shows this UA but libmpv still 403s, the
+                // failure is a stale client identity (refresh the ladder), not a header-wiring bug.
+                NSLog("[yt-probe] videoHost=%@ sidecar=%@ requiredUA=%@",
+                      resolved.videoURL.host ?? "?", resolved.audioURL == nil ? "none" : (resolved.audioURL!.host ?? "?"),
+                      googlevideoUserAgent)
+                return resolved
+            }
+        }
+        NSLog("[yt-direct] id=%@ client=%@ %@ h=%d", videoID, "-", "MISS", 0)
+        return nil
+    }
+
+    // MARK: - InnerTube client ladder
+
+    /// The public "web" InnerTube API key. Long-lived, shipped in YouTube's own web client; used
+    /// unauthenticated for the /player call (same constant as the worker).
+    private static let innertubeKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+
+    /// Per-client timeout. Bounds a cold-miss ladder (3 clients) so a stalled edge cannot serialize into a
+    /// long wait; a timeout is treated as a miss.
+    private static let clientTimeout: TimeInterval = 5
+
+    /// One InnerTube client identity: `context` is the exact `client` object sent in the request body; `ua`
+    /// is the matching User-Agent header; `clientNameNum` is the numeric id for the x-youtube-client-name
+    /// header (yt-dlp INNERTUBE_CONTEXT_CLIENT_NAME).
+    private struct Client {
+        let name: String
+        let ua: String
+        let clientNameNum: Int
+        let clientVersion: String
+        let context: [String: Any]
+    }
+
+    /// Ladder order: IOS first (best formats on residential IPs), then ANDROID, then the embedded-TV client
+    /// as a last resort (nsig-free for embeddable videos). Identity strings copied from yt_resolve.ts.
+    private static let clients: [Client] = [
+        Client(
+            name: "IOS",
+            ua: googlevideoUserAgent,   // the exact UA googlevideo binds the returned URLs to; see the constant above
+            clientNameNum: 5,
+            clientVersion: "21.02.3",
+            context: [
+                "clientName": "IOS",
+                "clientVersion": "21.02.3",
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "osName": "iPhone",
+                "osVersion": "18.3.2.22D82",
+                "userAgent": "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+                "hl": "en",
+                "gl": "US",
+            ]
+        ),
+        Client(
+            name: "ANDROID",
+            ua: "com.google.android.youtube/21.02.35 (Linux; U; Android 11) gzip",
+            clientNameNum: 3,
+            clientVersion: "21.02.35",
+            context: [
+                "clientName": "ANDROID",
+                "clientVersion": "21.02.35",
+                "androidSdkVersion": 30,
+                "osName": "Android",
+                "osVersion": "11",
+                "userAgent": "com.google.android.youtube/21.02.35 (Linux; U; Android 11) gzip",
+                "hl": "en",
+                "gl": "US",
+            ]
+        ),
+        Client(
+            name: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            ua: "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+            clientNameNum: 85,
+            clientVersion: "2.0",
+            context: [
+                "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                "clientVersion": "2.0",
+                "clientScreen": "EMBED",
+                "userAgent": "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+                "hl": "en",
+                "gl": "US",
+            ]
+        ),
+    ]
+
+    // MARK: - InnerTube /player call
+
+    /// The slice of the /player response we read. Any format that only exposes `signatureCipher`/`cipher`
+    /// (a JS-required client) is rejected by the pickers below -- the whole point is no nsig, no JS engine.
+    private struct PlayerResponse: Decodable {
+        struct PlayabilityStatus: Decodable { let status: String? }
+        struct Format: Decodable {
+            let itag: Int?
+            let url: String?
+            let mimeType: String?
+            let signatureCipher: String?
+            let cipher: String?
+            let height: Int?
+            let bitrate: Int?
+        }
+        struct StreamingData: Decodable {
+            let formats: [Format]?
+            let adaptiveFormats: [Format]?
+        }
+        let playabilityStatus: PlayabilityStatus?
+        let streamingData: StreamingData?
+    }
+
+    /// POST the InnerTube /player call for one client. Returns the streamingData on a playable answer, nil on
+    /// any error, non-OK playability, or an empty response. Never throws.
+    private static func fetchStreamingData(videoID: String, client: Client) async -> PlayerResponse.StreamingData? {
+        guard let url = URL(string: "https://www.youtube.com/youtubei/v1/player?key=\(innertubeKey)&prettyPrint=false") else {
+            return nil
+        }
+        var req = URLRequest(url: url, timeoutInterval: clientTimeout)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.setValue(client.ua, forHTTPHeaderField: "user-agent")
+        // The numeric client name header some InnerTube edges expect; harmless when ignored.
+        req.setValue(String(client.clientNameNum), forHTTPHeaderField: "x-youtube-client-name")
+        req.setValue(client.clientVersion, forHTTPHeaderField: "x-youtube-client-version")
+        req.setValue("https://www.youtube.com", forHTTPHeaderField: "origin")
+
+        let body: [String: Any] = [
+            "videoId": videoID,
+            "context": [
+                "client": client.context,
+                // A minimal user-info block; InnerTube tolerates it and it mirrors real clients.
+                "user": ["lockedSafetyMode": false],
+                "request": ["useSsl": true],
+            ],
+            "contentCheckOk": true,
+            "racyCheckOk": true,
+            "playbackContext": [
+                "contentPlaybackContext": ["html5Preference": "HTML5_PREF_WANTS"],
+            ],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        req.httpBody = data
+
+        do {
+            let (respData, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+            guard let decoded = try? JSONDecoder().decode(PlayerResponse.self, from: respData) else { return nil }
+            guard decoded.playabilityStatus?.status == "OK" else { return nil }
+            return decoded.streamingData
+        } catch {
+            return nil
+        }
+    }
+
+    // MARK: - Format picking
+
+    /// A format is usable only when it carries a bare `url` (no signatureCipher/cipher = no decipher needed)
+    /// AND that url points at googlevideo (a sanity gate against a poisoned/odd response).
+    private static func plainURL(_ f: PlayerResponse.Format) -> URL? {
+        guard f.signatureCipher == nil, f.cipher == nil,
+              let raw = f.url, !raw.isEmpty,
+              let url = URL(string: raw),
+              let host = url.host, host.contains("googlevideo") else { return nil }
+        return url
+    }
+
+    /// Apply the resolution policy to one client's streamingData. Prefer the highest-quality playable
+    /// option: an adaptive video+audio pair wins when it is sharper than the best muxed stream; otherwise the
+    /// simpler self-contained muxed stream wins.
+    ///
+    ///   * wantMuxedOnly -> best muxed only (nil when none). A caller that literally cannot take a sidecar
+    ///     (a pure AVPlayer context) sets this; NO shipping trailer/ambient caller does, they all play
+    ///     through mpv, which mounts the audio leg as `--audio-file`.
+    ///   * otherwise -> the sharper of the adaptive pair and best muxed stream. This prevents an available
+    ///     1080p adaptive trailer from being discarded merely because YouTube also exposed itag 18 (360p).
+    ///
+    /// The earlier policy took the adaptive pair only when its height was > 720 and otherwise demanded a
+    /// muxed format. That silently returned nil for the (now common) modern trailer that a residential IOS
+    /// InnerTube client answers with ZERO muxed formats and a best adaptive avc1 stream at <= 720 (verified
+    /// live: a real trailer returns playable OK, muxed 0, adaptive avc1 topping out at 720 with audio/mp4
+    /// present, yet the old gate discarded that perfectly playable pair). Muxed formats are no longer the
+    /// >720 discriminator, so the pair is accepted at whatever height the client offers.
+    private static func pick(from streaming: PlayerResponse.StreamingData,
+                             maxHeight: Int,
+                             wantMuxedOnly: Bool,
+                             userAgent: String) async -> Resolved? {
+        let muxed = pickMuxed(streaming.formats ?? [])
+        if wantMuxedOnly {
+            guard let muxed, await tailIsReachable(muxed.url, userAgent: userAgent) else { return nil }
+            return Resolved(videoURL: muxed.url, audioURL: nil, height: muxed.height, isMuxed: true)
+        }
+
+        let pair = await pickAdaptivePair(streaming.adaptiveFormats ?? [],
+                                          maxHeight: maxHeight,
+                                          userAgent: userAgent)
+        let reachableMuxed: (url: URL, height: Int)?
+        if let muxed, await tailIsReachable(muxed.url, userAgent: userAgent) {
+            reachableMuxed = muxed
+        } else {
+            reachableMuxed = nil
+        }
+        if let pair, pair.height > (reachableMuxed?.height ?? 0) {
+            return Resolved(videoURL: pair.video, audioURL: pair.audio, height: pair.height, isMuxed: false)
+        }
+        if let muxed = reachableMuxed {
+            return Resolved(videoURL: muxed.url, audioURL: nil, height: muxed.height, isMuxed: true)
+        }
+        if let pair {
+            return Resolved(videoURL: pair.video, audioURL: pair.audio, height: pair.height, isMuxed: false)
+        }
+        return nil
+    }
+
+    /// Best muxed progressive format: itag 22 (720p mp4) then 18 (360p mp4), plain url only. InnerTube
+    /// `formats` is the muxed set; `adaptiveFormats` is the split set, deliberately never read here.
+    private static func pickMuxed(_ formats: [PlayerResponse.Format]) -> (url: URL, height: Int)? {
+        for itag in [22, 18] {
+            if let f = formats.first(where: { $0.itag == itag }), let url = plainURL(f) {
+                return (url, f.height ?? (itag == 22 ? 720 : 360))
+            }
+        }
+        return nil
+    }
+
+    /// Best COMPLETE adaptive video+audio pair under `maxHeight`. YouTube can issue a URL whose beginning is
+    /// readable but whose final byte range is rejected with 403. That exact shape played normally for about a
+    /// minute and then stopped when `VXTrailerProxy` reached the last window. Probe the tail before accepting a
+    /// format and fall through to the next best representation when the CDN issued a truncated URL.
+    ///
+    /// Prefer resolution first, then codec (H.264, VP9, AV1), then bitrate. MPVKit includes dav1d, so an AV1
+    /// MP4 is a valid completeness fallback when YouTube's higher H.264 representations reject their tails.
+    /// Audio stays AAC/MP4 and is tail-probed as well. Both legs must be complete or there is no pair.
+    private static func pickAdaptivePair(_ adaptive: [PlayerResponse.Format],
+                                         maxHeight: Int,
+                                         userAgent: String) async -> (video: URL, audio: URL, height: Int)? {
+        let audioCandidates: [(url: URL, bitrate: Int)] = adaptive.compactMap { f in
+            guard let mime = f.mimeType, mime.hasPrefix("audio/mp4"),
+                  let url = plainURL(f) else { return nil }
+            return (url, f.bitrate ?? 0)
+        }.sorted { $0.bitrate > $1.bitrate }
+
+        var audioURL: URL?
+        for audio in audioCandidates {
+            if await tailIsReachable(audio.url, userAgent: userAgent) {
+                audioURL = audio.url
+                break
+            }
+        }
+        guard let audioURL else { return nil }
+
+        func codecRank(_ mime: String) -> Int? {
+            guard mime.hasPrefix("video/mp4") else { return nil }
+            if mime.contains("avc1") { return 0 }
+            if mime.contains("vp9") || mime.contains("vp09") { return 1 }
+            if mime.contains("av01") { return 2 }
+            return nil
+        }
+
+        let videoCandidates: [(url: URL, height: Int, codecRank: Int, bitrate: Int)] = adaptive.compactMap { f in
+            guard let mime = f.mimeType, let rank = codecRank(mime),
+                  let height = f.height, height <= maxHeight,
+                  let url = plainURL(f) else { return nil }
+            return (url, height, rank, f.bitrate ?? 0)
+        }.sorted {
+            if $0.height != $1.height { return $0.height > $1.height }
+            if $0.codecRank != $1.codecRank { return $0.codecRank < $1.codecRank }
+            return $0.bitrate > $1.bitrate
+        }
+
+        for video in videoCandidates {
+            if await tailIsReachable(video.url, userAgent: userAgent) {
+                return (video.url, audioURL, video.height)
+            }
+        }
+        return nil
+    }
+
+    /// A 32-byte tail read is enough to reject the broken googlevideo URLs that otherwise fail only at the
+    /// end of playback. Missing `clen` stays fail-soft: the URL is kept rather than rejected on metadata alone.
+    private static func tailIsReachable(_ url: URL, userAgent: String) async -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let rawLength = components.queryItems?.first(where: { $0.name == "clen" })?.value,
+              let length = Int(rawLength), length > 0 else { return true }
+
+        let start = max(0, length - 32)
+        var request = URLRequest(url: url, timeoutInterval: 4)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("bytes=\(start)-\(length - 1)", forHTTPHeaderField: "Range")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode), !data.isEmpty else { return false }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    // MARK: - In-memory cache
+
+    /// googlevideo urls expire ~6h after issue; a 2h TTL keeps cached entries comfortably inside that window
+    /// while letting hero + trailer button share one resolve.
+    private static let cacheTTL: TimeInterval = 2 * 60 * 60
+
+    /// Tiny actor-guarded cache: key = videoID|maxHeight|muxedOnly -> Resolved. Expired entries are dropped
+    /// on read; the map stays small (a handful of trailers per browsing session).
+    private actor ResolveCache {
+        private var entries: [String: (value: Resolved, stored: Date)] = [:]
+
+        func get(_ key: String) -> Resolved? {
+            guard let e = entries[key] else { return nil }
+            guard Date().timeIntervalSince(e.stored) < YouTubeDirectResolver.cacheTTL else {
+                entries[key] = nil
+                return nil
+            }
+            return e.value
+        }
+
+        func set(_ key: String, _ value: Resolved) {
+            entries[key] = (value, Date())
+        }
+    }
+
+    private static let cache = ResolveCache()
+}

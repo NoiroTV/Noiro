@@ -1,0 +1,3 @@
+[submodule "vendor/kodi"]
+	path = vendor/kodi
+	url = https://github.com/NoiroTV/noiro-kodi-engine.git

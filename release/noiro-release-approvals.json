@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "product": "noiro",
+  "release_allowed": false,
+  "approvals": {
+    "name_clearance": { "approved": false, "evidence": "" },
+    "server_js_redistribution_or_replacement": { "approved": false, "evidence": "" },
+    "dependency_and_codec_rights": { "approved": false, "evidence": "" },
+    "service_and_metadata_rights": { "approved": false, "evidence": "" },
+    "asset_and_provider_mark_rights": { "approved": false, "evidence": "" },
+    "apple_platform_feature_parity": { "approved": false, "evidence": "" },
+    "real_device_playback": { "approved": false, "evidence": "" },
+    "security_and_realm_isolation": { "approved": false, "evidence": "" },
+    "developer_id_notarization": { "approved": false, "evidence": "" },
+    "customer_xcode_signing": { "approved": false, "evidence": "" },
+    "matching_gpl_source": { "approved": false, "evidence": "" },
+    "policies_and_registration": { "approved": false, "evidence": "" }
+  }
+}

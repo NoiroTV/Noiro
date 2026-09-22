@@ -1,0 +1,1386 @@
+import Foundation
+import Combine
+
+/// Codable mirrors of the `stremio-core` JSON shapes we read via `CoreBridge`. Field names match the
+/// engine's serde output (camelCase, with a few explicit renames). `Core`-prefixed to avoid clashing
+/// with the legacy hand-rolled models (MetaPreview, Descriptor, …) during the screen-by-screen migration.
+
+/// A whole-seconds count to a compact timecode: "M:SS" under an hour, "H:MM:SS" past it. The shared
+/// "resume 1:03" / "45:12" / "1:12:30" affordance used on Continue Watching cards and the detail
+/// primary button (mirrors the webapp's `formatTime`). Returns nil for non-positive input so callers
+/// can cleanly omit the badge / suffix when there is nothing to resume.
+func resumeTimecode(_ seconds: Double) -> String? {
+    guard seconds.isFinite, seconds >= 1 else { return nil }
+    let total = Int(seconds)
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let s = total % 60
+    return h > 0
+        ? String(format: "%d:%02d:%02d", h, m, s)
+        : String(format: "%d:%02d", m, s)
+}
+
+// MARK: continue_watching_preview
+
+struct CoreCWPreview: Decodable {
+    let items: [CoreCWItem]
+}
+
+struct CoreCWItem: Decodable, Identifiable {
+    let id: String
+    let type: String
+    let name: String
+    let poster: String?
+    let state: CoreLibState
+    /// Library bookkeeping: a removed entry stays in the bucket flagged `removed`,
+    /// and watched-from-catalog markers are `temp`. "In the library" means neither.
+    var removed: Bool? = nil
+    var temp: Bool? = nil
+
+    enum CodingKeys: String, CodingKey { case id = "_id", type, name, poster, state, removed, temp }
+
+    /// 0…1 watch progress (timeOffset/duration; both in ms).
+    var progress: Double {
+        guard state.duration > 0 else { return 0 }
+        return min(max(state.timeOffset / state.duration, 0), 1)
+    }
+
+    /// The saved resume position in whole seconds (`timeOffset` is ms), so a card can show where
+    /// playback will pick up ("Resume 1:03"). 0 when nothing has been played into this title.
+    var resumeSeconds: Double { max(0, state.timeOffset / 1000) }
+
+    /// Stremio can leave a mirrored series parked on the episode it just completed while its UI resolves
+    /// the next unwatched episode from metadata. Keep that raw state for routing, but treat the retained
+    /// card as a next-episode placeholder rather than presenting the completed episode's progress.
+    var isMirroredCompletedSeries: Bool {
+        MirrorSettings.mirrorContinueWatching && type == "series" && progress >= 0.9
+    }
+
+    /// Visual progress for a Continue Watching card. A retained mirrored series points at the next
+    /// unstarted episode, so it must not inherit the completed episode's full progress stripe.
+    var continueWatchingDisplayProgress: Double? {
+        guard !isMirroredCompletedSeries, progress > 0.01 else { return nil }
+        return progress
+    }
+
+    /// The completed episode's resume time is equally stale once the card represents the next episode.
+    var continueWatchingDisplayResumeSeconds: Double? {
+        guard !isMirroredCompletedSeries, resumeSeconds >= 1 else { return nil }
+        return resumeSeconds
+    }
+
+    /// Whether this title is effectively FINISHED and should drop out of Continue Watching.
+    ///
+    /// The engine's `is_in_continue_watching()` is just `time_offset > 0` with no completion check, so a
+    /// title watched to the end (or marked watched, or finished on another device and synced down) keeps a
+    /// non-zero offset and lingers in the rail forever. The runtime rewind (`finishedWatching`) only fires
+    /// from a local play-to-EOF, so nothing catches the marked-watched or watched-elsewhere cases. This is
+    /// the data-layer backstop CoreBridge applies before publishing the rail.
+    ///
+    /// - Movie: finished when it is at/past the engine's own 0.9 credits threshold, OR when the engine
+    ///   flagged it watched (`flaggedWatched`/`timesWatched > 0`) AND it is not currently being re-watched.
+    ///   A movie the user finished once and is now re-watching has its offset reset to a low/mid value, so
+    ///   it sits in the live-in-progress band (`resumeFloor`…0.9); that must KEEP it in the rail so the
+    ///   rewatch shows and resumes, even though the watched counters are non-zero. A movie parked at the
+    ///   credits, or freshly flagged-watched with no active offset, has no in-progress position and clears.
+    /// - Series: `timesWatched` counts WATCHED EPISODES, so a mid-series item has it high while still
+    ///   actively resumable, meaning it must NOT gate the rail. A current episode at/past 0.9 is treated as
+    ///   finished by the normal Noiro-owned path. The Stremio-mirror path deliberately overrides that prune:
+    ///   Stremio can leave `video_id` and progress parked on the completed episode while its UI derives the
+    ///   next unwatched episode from metadata. Keeping that mirrored card lets Noiro do the same.
+    var isFinished: Bool {
+        let watchedToEnd = progress >= 0.9
+        if type == "series" { return watchedToEnd }
+        // A live, resumable position (progress above the resume floor but below the finished ceiling)
+        // means an active watch/rewatch: keep it even if the watched counters are set.
+        let resumeFloor = 0.0
+        let inProgress = progress > resumeFloor && progress < 0.9
+        if inProgress { return false }
+        return watchedToEnd || state.flaggedWatched > 0 || state.timesWatched > 0
+    }
+
+    /// The engine's own "has been watched" predicate (upstream `LibraryItem::watched()`:
+    /// `times_watched > 0`), driving the Library poster badge (DESIGN.md "PosterCard —
+    /// Watched state"). `LibraryItemMarkAsWatched` and every finished play/episode bump
+    /// `timesWatched`; unmark resets it to 0. `flaggedWatched` is deliberately NOT consulted:
+    /// upstream documents it as a per-video "watched event sent" latch, not the indicator.
+    /// Distinct from `isFinished`, which answers the Continue-Watching prune question.
+    var isWatched: Bool { state.timesWatched > 0 }
+}
+
+struct CoreLibState: Decodable {
+    let timeOffset: Double
+    let duration: Double
+    let videoId: String?
+    /// Engine watched-bookkeeping. `flaggedWatched` (movies) flips to 1 when a movie is marked/played
+    /// to the end; `timesWatched` counts finished plays (movies) or watched episodes (series). Both are
+    /// camelCase in the engine's serialization and default to 0 for older/sparser entries that omit them.
+    let flaggedWatched: Int
+    let timesWatched: Int
+
+    enum CodingKeys: String, CodingKey {
+        case timeOffset, duration, videoId = "video_id", flaggedWatched, timesWatched
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        timeOffset = (try c.decodeIfPresent(Double.self, forKey: .timeOffset)) ?? 0
+        duration = (try c.decodeIfPresent(Double.self, forKey: .duration)) ?? 0
+        videoId = try c.decodeIfPresent(String.self, forKey: .videoId)
+        flaggedWatched = (try c.decodeIfPresent(Int.self, forKey: .flaggedWatched)) ?? 0
+        timesWatched = (try c.decodeIfPresent(Int.self, forKey: .timesWatched)) ?? 0
+    }
+
+    /// Explicit memberwise init: declaring `init(from:)` above suppresses the synthesized one, and the
+    /// overlay-profile builders in Profiles.swift construct states by hand. The two watched-count fields
+    /// default to 0 (the overlay rail does its own finished-movie pruning), so those call sites are
+    /// unchanged. `nil` videoId keeps the movie case working.
+    init(timeOffset: Double, duration: Double, videoId: String?,
+         flaggedWatched: Int = 0, timesWatched: Int = 0) {
+        self.timeOffset = timeOffset
+        self.duration = duration
+        self.videoId = videoId
+        self.flaggedWatched = flaggedWatched
+        self.timesWatched = timesWatched
+    }
+}
+
+// MARK: Continue-Watching exact-source resume
+
+/// The URL a Continue-Watching resume should hand the player for the EXACT source this title last played,
+/// PLUS whether that URL was freshly minted for that same source. Owner requirement: resume plays THAT
+/// source (source #3 the user chose), not a re-run of source selection across all add-ons.
+///
+/// When the stored entry carries native-debrid provenance (`debridService` + `infoHash`, recorded on play
+/// in `LastStreamStore.record`), we mint a FRESH direct link for that same file through the same provider
+/// via `DebridCoordinator.reresolve` (a single `requestdl` on TorBox's stored torrentId/fileId, no full
+/// add-on re-resolve, no auto-pick. Debrid links are time-limited and expire between sessions, so replaying
+/// the stored `url` alone dead-ends on "this source didn't load" and the player then hops across every
+/// source (the "Tried N sources" failure); reresolving the SAME source avoids that entirely.
+///
+/// Fail-soft and provenance-optional: an entry with no debrid ids (a plain-direct or torrent/loopback
+/// resume) returns the stored `url` unchanged with `refreshed == false`, so those paths are byte-identical.
+/// A debrid entry whose file is genuinely gone (reresolve throws `.notCached`/`.noKey`) also falls back to
+/// the stored `url`; the caller's existing player failover is the last resort only when the SAME source is
+/// truly unavailable.
+@MainActor
+enum CWResume {
+    /// How recently the stored debrid link must have been minted for a resume to replay it INSTANTLY without
+    /// a reresolve round-trip. Debrid direct links live for hours, so a link minted within this window is
+    /// almost certainly still valid; a conservative 20 minutes keeps the "quick pause then resume" case
+    /// instant while anything older takes the reliable reresolve path.
+    private static let freshLinkWindow: TimeInterval = 20 * 60
+
+    /// Resolve the exact stored source to a playable URL. `refreshed` is true when the URL is AUTHORITATIVE
+    /// and should be played directly (a freshly minted debrid link, OR a stored link still inside the fresh
+    /// window); false only when we fell back to a possibly-stale stored link because the source could not be
+    /// reresolved, so the caller keeps its stale-link failover priming. Never throws.
+    static func resolvedURL(for entry: LastStreamStore.Entry) async -> (url: URL, refreshed: Bool) {
+        let stored = URL(string: entry.url)
+        // No debrid provenance (plain-direct / torrent / usenet with no reresolve id): the stored link is
+        // all we have. Return it unchanged so these paths behave exactly as before.
+        guard let serviceRaw = entry.debridService, let service = DebridService(rawValue: serviceRaw),
+              let infoHash = entry.infoHash, !infoHash.isEmpty else {
+            return (stored ?? URL(fileURLWithPath: "/"), false)
+        }
+        // INSTANT RESUME (Step 4): the previous behaviour reresolved a fresh link on EVERY resume, a blocking
+        // network round-trip before the player appeared (the "CW resume is slow" regression). But a debrid
+        // link minted moments ago is still valid, so when the stored link is inside the fresh window hand it
+        // straight back with refreshed:true. The caller plays it immediately and attaches the debridRef, whose
+        // ids let the player's own load-failure failover mint a fresh link ONLY if this fresh link somehow
+        // dead-ends (strictly safer than today's fallback, which already plays a possibly-STALE stored link).
+        if let stored, let savedAt = entry.linkSavedAt {
+            let age = Date().timeIntervalSince(savedAt)
+            if age >= 0, age < Self.freshLinkWindow { return (stored, true) }
+        }
+        // Older than the window (or no mint timestamp): mint a FRESH link for the SAME file through the SAME
+        // provider. On TorBox this is a single requestdl off the stored torrentId+fileId (no re-add); other
+        // providers re-add from the infoHash+fileIdx, still far cheaper than a full source re-resolve, and
+        // still the SAME source.
+        if let fresh = try? await DebridCoordinator.shared.reresolve(
+            service: service, infoHash: infoHash,
+            torrentId: entry.debridTorrentId, fileId: entry.debridFileId, fileIdx: entry.fileIdx) {
+            return (fresh, true)
+        }
+        // Same source is genuinely unavailable (evicted / no key): fall back to the stored link, letting the
+        // player's existing load-failure failover take over only now.
+        return (stored ?? URL(fileURLWithPath: "/"), false)
+    }
+}
+
+// MARK: board (catalogs_with_extra)
+
+struct CoreBoardState: Decodable {
+    let catalogs: [[CoreCatalogPage]]
+}
+
+struct CoreCatalogPage: Decodable {
+    let request: CoreResourceRequest
+    let content: CoreLoadable<[CoreMeta]>?
+}
+
+struct CoreResourceRequest: Decodable {
+    let base: String
+    let path: CoreResourcePath
+}
+
+struct CoreResourcePath: Decodable {
+    let resource: String
+    let type: String
+    let id: String
+}
+
+/// Mirrors `Loadable<R, E>` = `#[serde(tag = "type", content = "content")]`:
+/// `{"type":"Loading"}` | `{"type":"Ready","content":R}` | `{"type":"Err","content":E}`.
+enum CoreLoadable<T: Decodable>: Decodable {
+    case loading
+    case ready(T)
+    case err
+
+    private enum CodingKeys: String, CodingKey { case type, content }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let tag = try container.decode(String.self, forKey: .type)
+        switch tag {
+        case "Ready": self = .ready(try container.decode(T.self, forKey: .content))
+        case "Err": self = .err
+        case "Loading": self = .loading
+        // Any other tag (an engine "Err"-shape rename, or a genuinely errored group with an
+        // unknown tag) is TERMINAL, not still-loading. Decoding it as .loading would leave
+        // streamLoadProgress stuck at N-1/N and spin the source list forever. Treat it as
+        // terminal (.err, which streamLoadProgress already counts as settled) and log the
+        // surprise so an engine tag rename is visible instead of silent.
+        default:
+            NSLog("[core] CoreLoadable unknown tag '\(tag)' — treating as terminal (.err)")
+            self = .err
+        }
+    }
+
+    var ready: T? { if case let .ready(value) = self { return value } else { return nil } }
+    var isLoading: Bool { if case .loading = self { return true } else { return false } }
+}
+
+struct CoreMeta: Decodable, Identifiable {
+    let id: String
+    let type: String
+    let name: String
+    let poster: String?
+    let posterShape: String?
+    /// The channel mark on live (tv/channel/events) catalog previews — channels publish a `logo`
+    /// instead of box-art, so the Live surface's `ChannelTile` prefers it over `poster`. Optional;
+    /// VOD previews omit it and decode fine.
+    let logo: String?
+    // Optional preview details most catalog add-ons include; they power the focused-hero
+    // backdrop on the browse pages. All optional so older/sparser add-ons still decode.
+    let background: String?
+    let description: String?
+    let releaseInfo: String?
+    /// Rating + genres live in `links` in the engine's catalog-preview serialization (category "imdb"
+    /// carries the rating in its name; category "Genres" carries each genre), NOT as top-level fields.
+    /// The engine never emits a top-level `imdbRating`/`genres` for a preview, so the old stored
+    /// properties decoded nil every time and the featured hero never showed a rating. Read them from
+    /// `links` instead — the same place CoreMetaItem (the full detail meta) reads them.
+    let links: [CoreLink]?
+
+    var imdbRating: String? {
+        (links ?? []).first { $0.category.caseInsensitiveCompare("imdb") == .orderedSame }?.name
+    }
+    var genres: [String]? {
+        let g = (links ?? []).filter { ["genre", "genres"].contains($0.category.lowercased()) }.map(\.name)
+        return g.isEmpty ? nil : g
+    }
+}
+
+struct CoreLocalSearchState: Decodable {
+    let searchResults: [CoreSearchSuggestion]
+}
+
+struct CoreSearchSuggestion: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let type: String
+    let poster: String?
+    let releaseInfo: String?
+}
+
+// MARK: ctx (only what we need: addon manifests for catalog row titles)
+
+struct CoreCtx: Decodable {
+    let profile: CoreProfile
+}
+
+struct CoreProfile: Decodable {
+    let addons: [CoreDescriptor]
+}
+
+struct CoreDescriptor: Decodable, Identifiable {
+    let manifest: CoreManifest
+    let transportUrl: String
+    let flags: CoreDescriptorFlags?
+    var id: String { transportUrl }
+    /// Default addons (Cinemeta, the local addon) the engine refuses to uninstall.
+    var isProtected: Bool { flags?.protected ?? false }
+    /// A Stremio default/official add-on (Cinemeta, the local add-on, WatchHub, Public Domain, …). A
+    /// logout resets the profile to ONLY these, so "every add-on is official" means the user's installed
+    /// add-ons were wiped.
+    var isOfficial: Bool { flags?.official ?? false }
+
+    var providesStreams: Bool { (manifest.resources ?? []).contains { $0.name == "stream" } }
+    var providesMeta: Bool { (manifest.resources ?? []).contains { $0.name == "meta" } }
+    var providesSubtitles: Bool { (manifest.resources ?? []).contains { $0.name == "subtitles" } }
+    var hasCatalogs: Bool { !manifest.catalogs.isEmpty }
+    /// Host only (the full transportUrl can embed a debrid config token).
+    var host: String { URL(string: transportUrl)?.host ?? transportUrl }
+    /// True when the add-on declares a web configuration page (manifest behaviorHints.configurable).
+    var isConfigurable: Bool { manifest.behaviorHints?.configurable == true }
+    /// The add-on's configuration page: the manifest URL with the trailing `manifest.json` swapped for
+    /// `configure` (the Stremio convention). Opens in a browser on iPhone/iPad/Mac; on Apple TV the
+    /// Configure sheet shows it as a QR to finish on a phone (or via the web dashboard).
+    var configureURL: URL? {
+        guard isConfigurable else { return nil }
+        if transportUrl.hasSuffix("/manifest.json") {
+            return URL(string: String(transportUrl.dropLast("manifest.json".count)) + "configure")
+        }
+        return URL(string: transportUrl)
+    }
+    /// "Catalogs · Streams · Subtitles", the resource kinds the addon exposes.
+    var capabilities: String {
+        var caps: [String] = []
+        if hasCatalogs { caps.append("Catalogs") }
+        if providesStreams { caps.append("Streams") }
+        if providesMeta { caps.append("Metadata") }
+        if providesSubtitles { caps.append("Subtitles") }
+        return caps.isEmpty ? "Add-on" : caps.joined(separator: " · ")
+    }
+}
+
+struct CoreManifest: Decodable {
+    let name: String
+    let catalogs: [CoreManifestCatalog]
+    let resources: [CoreManifestResource]?
+    /// Manifest-level behaviorHints; `configurable` means the add-on exposes a web configuration page.
+    let behaviorHints: CoreManifestBehaviorHints?
+    /// The add-on's logo URL (Stremio `manifest.logo`). AIOManager bakes a user's custom logo here, so
+    /// Noiro renders it on the add-on row for parity. Optional; older/sparser manifests omit it.
+    let logo: String?
+}
+
+/// Manifest-level `behaviorHints` (distinct from the meta-level + per-stream ones). `configurable` flags
+/// that the add-on has a config page (Stremio convention: its manifest URL with `manifest.json` -> `configure`).
+struct CoreManifestBehaviorHints: Decodable {
+    let configurable: Bool?
+    let configurationRequired: Bool?
+}
+
+/// `ManifestResource` is `#[serde(untagged)]`: either a bare string ("stream") or an object
+/// ({ name: "stream", types: [...] }). Decode either into the resource name.
+struct CoreManifestResource: Decodable {
+    let name: String
+    init(from decoder: Decoder) throws {
+        if let short = try? decoder.singleValueContainer().decode(String.self) { name = short; return }
+        name = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .name)
+    }
+    enum CodingKeys: String, CodingKey { case name }
+}
+
+struct CoreDescriptorFlags: Decodable {
+    let official: Bool?
+    let `protected`: Bool?
+}
+
+struct CoreManifestCatalog: Decodable {
+    let id: String
+    let type: String
+    let name: String?
+}
+
+// MARK: assembled UI row
+
+/// One Home board row: a titled, horizontally-scrolling catalog of meta previews. `type` is the
+/// catalog's content type (the per-row `request.path.type`, e.g. "movie" / "series" / "tv"), so a
+/// caller can pick out the Live rows (`LiveTypes`) without re-decoding the board state.
+struct CoreBoardRow: Identifiable {
+    let id: String
+    let title: String
+    let type: String
+    let items: [CoreMeta]
+    /// Index of this catalog in the engine's `board.catalogs`, so a Home row can ask the engine to
+    /// `LoadNextPage(engineIndex)` for its own horizontal infinite scroll (#95). Stable across page
+    /// loads and board widening; `buildBoardRows` captures it before the display filter/sort.
+    let engineIndex: Int
+}
+
+/// The content types Stremio treats as Live TV (the same set tvOS uses for its live-tuned player
+/// path): broadcast TV, individual channels, and live events. Shared so the Live surface, the live
+/// detail branch, and the player all agree on what "live" means.
+enum LiveTypes {
+    /// Add-ons label live content inconsistently, so match CASE-INSENSITIVELY across the common variants
+    /// instead of one exact set, which is why a "sport" / "Sports" / "live" / "linear" feed used to be
+    /// misread as VOD (the player must open in live mode or an HLS feed plays a few seconds and quits).
+    /// Builds on #94, which added "sport". Exact tokens only, never substrings, so "tv" can't swallow "tvshow".
+    static let all: Set<String> = [
+        "tv", "channel", "channels", "events", "event",
+        "sport", "sports", "live", "linear", "iptv",
+    ]
+    static func contains(_ type: String) -> Bool { all.contains(type.lowercased()) }
+}
+
+// MARK: meta_details
+
+struct CoreMetaDetails: Decodable {
+    let metaItems: [CoreMetaEntry]
+    let streams: [CoreStreamGroup]
+    /// Streams EMBEDDED in the meta itself (`MetaDetails.meta_streams`): the engine lifts the selected
+    /// video's `video.streams` array into this parallel surface. Catalog add-ons that serve plain HTTP or
+    /// HLS links usually inline them in the meta's videos instead of implementing a separate `stream`
+    /// resource, so official clients list `metaStreams` alongside `streams`. Ignoring this field made every
+    /// such add-on show zero sources (#122). Optional so an older payload without it still decodes.
+    let metaStreams: [CoreStreamGroup]?
+    /// The engine's library entry for this title (its state.timeOffset drives resume), if saved.
+    let libraryItem: CoreCWItem?
+    /// Watched episode ids, computed engine-side from the WatchedBitField (which isn't itself in JSON).
+    let watchedVideoIds: [String]?
+
+    /// Meta-embedded stream groups plus the stream-resource responses, in the engine's own
+    /// `[meta_streams, streams]` concat order. The single source every stream surface should walk, so a
+    /// meta-embedded HTTP/HLS source is never invisible to a path that only read `streams`.
+    var allStreamGroups: [CoreStreamGroup] { (metaStreams ?? []) + streams }
+
+    /// First fully-loaded meta (addons are queried in order; take the first that resolved).
+    var meta: CoreMetaItem? { metaItems.compactMap { $0.content?.ready }.first }
+    var watchedIds: Set<String> { Set(watchedVideoIds ?? []) }
+}
+
+/// `ResourceLoadable<MetaItem>`, one addon's meta response ({request, content}).
+struct CoreMetaEntry: Decodable {
+    let request: CoreResourceRequest
+    let content: CoreLoadable<CoreMetaItem>?
+}
+
+struct CoreMetaItem: Decodable {
+    let id: String
+    let type: String
+    let name: String
+    let poster: String?
+    let background: String?
+    let logo: String?
+    let description: String?
+    let releaseInfo: String?
+    let runtime: String?
+    let links: [CoreLink]?
+    let videos: [CoreVideo]?
+    /// Trailer streams the meta add-on attached (camelCase `trailerStreams` in the engine JSON).
+    /// Each is a full `Stream`, so a YouTube trailer flattens to a top-level `ytId` (see
+    /// `meta_item.rs` / `serialize_meta_details.rs`). Optional so sparser add-ons still decode.
+    let trailerStreams: [CoreStream]?
+    /// Meta-level behaviorHints (camelCase `behaviorHints` in the engine JSON; the bridge decoder
+    /// uses the default key strategy, same as `trailerStreams`). Distinct from the per-STREAM
+    /// `CoreStreamBehaviorHints`. Live/EPG add-ons set `hasScheduledVideos` here to flag that
+    /// `videos[]` is a now/next schedule rather than an episode list. Optional so sparse add-ons decode.
+    let behaviorHints: CoreMetaBehaviorHints?
+
+    var genres: [String] {
+        // The engine emits the genres link category as "Genres" (PLURAL); the old "Genre" (singular)
+        // filter matched nothing, so detail + episode headers always showed empty genres. Accept both.
+        (links ?? []).filter { ["genre", "genres"].contains($0.category.lowercased()) }.map(\.name)
+    }
+
+    /// A PROVISIONAL playback duration in seconds parsed from the human `runtime` string ("60 min",
+    /// "1h 32m", "92 min", "2:05:00"). Used by community trickplay to key + start capture at the first
+    /// positive timePos, BEFORE mpv emits its `duration` event (which a debrid MKV may never deliver). The
+    /// real mpv duration later refines the bucket. Returns nil when no number can be read.
+    var runtimeSeconds: Double? {
+        guard let r = runtime?.lowercased() else { return nil }
+        // `runtime` is add-on-supplied, so everything below computes in Double and caps each field: a garbage
+        // value like "3000000000000000:00:00" must yield nil, not trap on Int overflow or poison the community
+        // trickplay duration bucket. A single field over 24h (86_400s) is dropped; the final total must be
+        // finite and positive and is clamped to a 24h ceiling.
+        let maxSeconds = 86_400.0
+        func field(_ raw: Substring) -> Double? {
+            guard let n = Double(raw.trimmingCharacters(in: .whitespaces)),
+                  n.isFinite, n >= 0, n <= maxSeconds else { return nil }
+            return n
+        }
+        func finalize(_ seconds: Double) -> Double? {
+            guard seconds.isFinite, seconds > 0 else { return nil }
+            return min(seconds, maxSeconds)
+        }
+        // "h:mm:ss" or "mm:ss" colon form first.
+        if r.contains(":") {
+            let parts = r.split(separator: ":").compactMap { field($0) }
+            if parts.count == 3 { return finalize(parts[0] * 3600 + parts[1] * 60 + parts[2]) }
+            if parts.count == 2 { return finalize(parts[0] * 60 + parts[1]) }
+        }
+        // "1h 32m" / "1 h 32 min" form: sum hours + minutes when an explicit hour marker is present.
+        var totalMinutes = 0.0
+        var matched = false
+        let scanner = Scanner(string: r)
+        scanner.charactersToBeSkipped = CharacterSet.alphanumerics.inverted
+        while !scanner.isAtEnd {
+            guard let n = scanner.scanInt(), n >= 0 else { break }
+            let value = Double(n)
+            guard value <= maxSeconds else { return nil }
+            let unit = scanner.scanCharacters(from: CharacterSet.lowercaseLetters) ?? ""
+            if unit.hasPrefix("h") { totalMinutes += value * 60; matched = true }
+            else { totalMinutes += value; matched = true }   // bare number or "min" -> minutes
+        }
+        guard matched else { return nil }
+        return finalize(totalMinutes * 60)
+    }
+    var imdbRating: String? {
+        (links ?? []).first { $0.category.caseInsensitiveCompare("imdb") == .orderedSame }?.name
+    }
+
+    /// Credits, read from `links` where the engine serializes them as named link categories (each name
+    /// is one person). Accept singular and plural spellings, since add-ons differ. Empty when absent.
+    var cast: [String] { credits("cast", "actors", "actor") }
+    var directors: [String] { credits("director", "directors") }
+    var writers: [String] { credits("writer", "writers") }
+    private func credits(_ categories: String...) -> [String] {
+        (links ?? []).filter { categories.contains($0.category.lowercased()) }.map(\.name)
+    }
+
+    /// The first trailer's YouTube id, if the meta carries a playable YouTube trailer. Stremio metas
+    /// expose trailers via `trailerStreams` whose source is a YouTube id; some older add-ons only
+    /// fill `links` with a "Trailer" category pointing at a youtube.com URL, so fall back to that.
+    var trailerYouTubeID: String? {
+        if let yt = (trailerStreams ?? []).compactMap(\.ytId).first(where: { !$0.isEmpty }) {
+            return yt
+        }
+        let trailerLink = (links ?? []).first {
+            $0.category.caseInsensitiveCompare("Trailer") == .orderedSame
+        }
+        return trailerLink.flatMap { Self.youTubeID(from: $0.name) }
+    }
+
+    /// All episodes ordered (season, then episode, then id) across EVERY season — the list handed to the
+    /// player so in-player Next / auto-advance rolls past the season boundary into the next season's first
+    /// episode (was per-season, so it dead-ended at the last episode of a season).
+    var orderedEpisodes: [CoreVideo] { (videos ?? []).orderedBySeasonEpisode }
+
+    /// Extract a YouTube video id from a watch / share / embed URL (or a bare 11-char id).
+    static func youTubeID(from string: String) -> String? {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let url = URL(string: trimmed), let host = url.host?.lowercased() {
+            if host.contains("youtu.be") {
+                let id = url.lastPathComponent
+                return id.isEmpty ? nil : id
+            }
+            if host.contains("youtube.com") {
+                if let v = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "v" })?.value, !v.isEmpty {
+                    return v
+                }
+                // /embed/<id>, /shorts/<id>, /v/<id>
+                let last = url.lastPathComponent
+                return last.isEmpty ? nil : last
+            }
+        }
+        // Bare 11-character YouTube id.
+        let idChars = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+        if trimmed.count == 11, trimmed.unicodeScalars.allSatisfy({ idChars.contains($0) }) {
+            return trimmed
+        }
+        return nil
+    }
+
+    /// A minimal placeholder meta for a title whose Cinemeta meta is nil (a brand-new/unreleased title:
+    /// the `tt` exists at TMDB but is not yet in Cinemeta). The detail page is driven entirely by this
+    /// meta, so meta=nil used to leave an empty hero AND blocked the sources list. This synthesizes just
+    /// enough (id, type, name, and Stremio's standard metahub-by-tt backdrop/logo) so the hero paints and
+    /// the stream request can still fire on the `tt`. Built via JSON decode so it tracks the struct's own
+    /// field set with no manual memberwise init. Returns nil only if the decoder itself fails (never, here).
+    static func placeholder(id: String, type: String, name: String) -> CoreMetaItem? {
+        let bg = id.hasPrefix("tt") ? "https://images.metahub.space/background/big/\(id)/img" : ""
+        let logo = id.hasPrefix("tt") ? "https://images.metahub.space/logo/medium/\(id)/img" : ""
+        let json: [String: Any] = [
+            "id": id, "type": type, "name": name,
+            "background": bg, "logo": logo,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(CoreMetaItem.self, from: data)
+    }
+}
+
+/// Meta-level `behaviorHints` (NOT the per-stream `CoreStreamBehaviorHints`). All fields optional so
+/// sparse add-ons decode. `hasScheduledVideos` marks a live channel whose `videos[]` is a now/next
+/// EPG schedule; `featuredVideoId` (when present) names the currently-airing program directly.
+struct CoreMetaBehaviorHints: Decodable {
+    let hasScheduledVideos: Bool?
+    let featuredVideoId: String?
+    /// The canonical video id for a single-video title (a movie). For a title from a TMDB/Kitsu catalog
+    /// the meta `id` is tmdb:/kitsu: but `defaultVideoId` carries the imdb id (tt...). Official Stremio
+    /// uses this as the movie stream-path id, so imdb-keyed stream add-ons (idPrefixes ["tt"]) match;
+    /// passing the raw tmdb id instead silently drops every imdb add-on from the plan.
+    let defaultVideoId: String?
+}
+
+/// Pure, engine-free now/next selection over a live channel's scheduled `videos[]`. Mirrors the
+/// reference serializer's now/next rule: NOW is the latest program that has already started
+/// (`released <= reference`), NEXT is the earliest program still to come (`released > reference`).
+/// Unit-testable in isolation: inject `reference` for deterministic results. Returns nil (so callers
+/// fall back to the description / hide the strip) unless the meta is flagged scheduled AND at least
+/// one dated program resolves to now or next.
+struct EPGSchedule {
+    let now: CoreVideo?
+    let next: CoreVideo?
+
+    init?(meta: CoreMetaItem, reference: Date = Date()) {
+        guard meta.behaviorHints?.hasScheduledVideos == true, let videos = meta.videos else { return nil }
+        let dated = videos.compactMap { v -> (CoreVideo, Date)? in v.releasedDate.map { (v, $0) } }
+        guard !dated.isEmpty else { return nil }
+        now  = dated.filter { $0.1 <= reference }.max { $0.1 < $1.1 }?.0
+        next = dated.filter { $0.1 >  reference }.min { $0.1 < $1.1 }?.0
+        guard now != nil || next != nil else { return nil }
+    }
+}
+
+struct CoreLink: Decodable {
+    let name: String
+    let category: String
+}
+
+struct CoreVideo: Decodable, Identifiable {
+    let id: String
+    let title: String?
+    let released: String?
+    let overview: String?
+    let thumbnail: String?
+    let season: Int?
+    let episode: Int?
+
+    /// Display helpers used by the player's episode list and Prev/Next buttons.
+    var episodeNumber: Int { episode ?? 0 }
+    var episodeTitle: String {
+        if let title, !title.isEmpty { return title }
+        return "Episode \(episode ?? 0)"
+    }
+
+    /// The `released` string parsed as a `Date` (non-breaking — display still uses the raw string).
+    /// Live/EPG schedules carry an ISO-8601 UTC timestamp here; try the plain form first, then the
+    /// fractional-seconds variant some add-ons emit. Returns nil when absent or unparseable.
+    var releasedDate: Date? {
+        guard let released else { return nil }
+        return ISO8601DateFormatter.epg.date(from: released)
+            ?? ISO8601DateFormatter.epgFractional.date(from: released)
+    }
+}
+
+extension Array where Element == CoreVideo {
+    /// Episodes ordered by (season, episode, id) across all seasons. The cross-season player list, so
+    /// auto-advance rolls from a season's last episode into the next season's first (shared by the iOS/Mac
+    /// and tvOS detail screens). Specials (season 0) sort first and don't interrupt end-of-season advance.
+    var orderedBySeasonEpisode: [CoreVideo] {
+        sorted {
+            let ls = $0.season ?? 0, rs = $1.season ?? 0
+            if ls != rs { return ls < rs }
+            let le = $0.episode ?? 0, re = $1.episode ?? 0
+            if le != re { return le < re }
+            return $0.id < $1.id
+        }
+    }
+}
+
+/// Shared key + filtering rule for the series-detail Specials preference. The raw engine model always
+/// keeps every episode; detail surfaces opt into this presentation filter so Settings can hide Season 0
+/// without changing library/watch data. An absent season follows the existing tvOS convention and is
+/// treated as Season 0 for this preference.
+enum SeriesDetailSettings {
+    static let hideSpecialsKey = "noiro.detail.hideSpecials"
+
+    static func visibleEpisodes(_ videos: [CoreVideo], hideSpecials: Bool) -> [CoreVideo] {
+        guard hideSpecials else { return videos }
+        return videos.filter { ($0.season ?? 0) != 0 }
+    }
+}
+
+extension ISO8601DateFormatter {
+    /// Shared formatters for parsing `CoreVideo.released` — `static let` so the EPG now/next pass
+    /// reuses one instance per form instead of allocating a formatter per video (they're costly).
+    static let epg = ISO8601DateFormatter()
+    static let epgFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+}
+
+/// One addon's stream response for the selected meta/episode (`ResourceLoadable<Vec<Stream>>`).
+struct CoreStreamGroup: Decodable {
+    let request: CoreResourceRequest
+    let content: CoreLoadable<[CoreStream]>?
+}
+
+/// A playable stream. `StreamSource` is `#[serde(untagged)]` + flattened, so the source fields
+/// (url / ytId / infoHash / externalUrl) sit at the top level, decode them all optionally.
+struct CoreStream: Decodable, Identifiable, Equatable {
+    let url: String?
+    let ytId: String?
+    let infoHash: String?
+    let fileIdx: Int?
+    let sources: [String]?
+    let externalUrl: String?
+    let name: String?
+    let description: String?
+    let behaviorHints: CoreStreamBehaviorHints?
+    /// Native Stremio USENET source fields (part of the stream spec, alongside url / ytId / infoHash):
+    /// `nzbUrl` is an http(s) link to an `.nzb`, and `fileMustInclude` is an optional regex that picks the
+    /// video inside the (potentially multi-file) usenet download. A stream with a non-nil `nzbUrl` is a
+    /// USENET stream — it resolves through the user's own usenet-capable debrid account (TorBox), never a
+    /// torrent swarm. All optional so a stream without them (every torrent/direct/YouTube source) still
+    /// decodes byte-identically to before.
+    let nzbUrl: String?
+    let fileMustInclude: String?
+
+    var id: String { (url ?? externalUrl ?? infoHash ?? nzbUrl ?? "?") + "#" + (name ?? "") + (description ?? "") }
+    var isTorrent: Bool { url == nil && infoHash != nil && nzbUrl == nil }
+
+    /// A USENET stream: no direct `url` yet, but an `.nzb` link to resolve through a usenet-capable debrid
+    /// account. Like a raw torrent, it needs resolution before it is playable — the usenet analogue of
+    /// `isTorrent`. Kept mutually exclusive from `isTorrent` (which now also checks `nzbUrl == nil`) so a
+    /// stream is classified as exactly one of torrent / usenet / direct.
+    var isUsenet: Bool { url == nil && (nzbUrl.map { !$0.isEmpty } ?? false) }
+
+    /// A bare YouTube source (`ytId`, no direct `url`): a trailer/clip from a trailer add-on like
+    /// Streailer, not a full feature stream. Playable (via the `/yt` route in `playableURL`) so the
+    /// user can tap it, but excluded from quality RANKING and the one-press auto-pick — otherwise an
+    /// unscored "🎬 Trailer" row could become `StreamRanking.best` and play the trailer in place of
+    /// the movie (and a trailer must never be recorded as Continue Watching).
+    var isYouTubeTrailer: Bool { url == nil && infoHash == nil && (ytId.map { !$0.isEmpty } ?? false) }
+
+    /// Direct/debrid URLs play as-is; torrents go through the embedded streaming server.
+    ///
+    /// A `ytId`-only stream is a YouTube source (e.g. a trailer add-on like Streailer returns
+    /// `{ "ytId": "…" }` streams, no `url`/`infoHash`): play it through the remote resolver's
+    /// `/yt/{id}` route — the same path the Trailer button uses (`TrailerRequest`). The remote
+    /// resolver needs no embedded server, so this is playable on every scheme including Lite.
+    /// Without this, every Streailer stream rendered as an inert lock-icon row.
+    var playableURL: URL? {
+        if let url, let parsed = URL(string: url) { return parsed }
+        // USENET: playable only when a TorBox key can resolve it. The play path
+        // (`DebridCoordinator.resolvedPlaybackRef`) turns the nzb into a direct https link BEFORE the
+        // player sees any URL; the nzb link here only makes the row tappable / identifies it. Without
+        // this, every usenet row rendered as a dead disabled label (every row gate keys on this
+        // property). No TorBox key -> nil, the pre-usenet behavior. Deliberately NOT behind the
+        // torrents gate: usenet resolves to a remote link, no embedded server needed (Lite plays it).
+        if isUsenet, DebridKeys.shared.isConfigured(.torBox), let nzb = nzbUrl, let parsed = URL(string: nzb) {
+            return parsed
+        }
+        if let ytId, !ytId.isEmpty {
+            return URL(string: "\(StremioServer.trailerResolverBase)/yt/\(ytId)")
+        }
+        guard !PlaybackSettings.torrentsDisabled else { return nil }
+        guard let hash = infoHash?.lowercased() else { return nil }
+        return URL(string: "\(StremioServer.base)/\(hash)/\(fileIdx ?? 0)")
+    }
+
+    /// The bare YouTube id of an `isYouTubeTrailer` source-list stream (a trailer add-on's `{ "ytId": "…" }`
+    /// row), or nil for any other stream. Lets the trailer-tap paths resolve such a row the SAME reliable
+    /// way as the built-in Trailer chip (device-direct InnerTube first, worker `/yt` fallback) instead of
+    /// only the plain worker URL in `playableURL`.
+    var youTubeTrailerID: String? {
+        guard isYouTubeTrailer, let ytId, !ytId.isEmpty else { return nil }
+        return ytId
+    }
+
+    /// Language-aware worker fallback URL for an `isYouTubeTrailer` stream: `vortexo.app/api/noiro/v1/edge/trailer/yt/{id}` with a
+    /// `?lang=` hint so the worker's own fallback chain (user-lang -> en -> original) returns the user's dub
+    /// (e.g. Italian). This differs from `playableURL`, which appends no language. Used only after the
+    /// device-direct resolver misses; nil for any non-trailer stream. Mirrors `TrailerRequest`'s worker shape.
+    func youTubeTrailerWorkerURL(languageCode: String?) -> URL? {
+        guard let yt = youTubeTrailerID else { return nil }
+        var c = URLComponents(string: "\(StremioServer.trailerResolverBase)/yt/\(yt)")
+        if let lang = languageCode, !lang.isEmpty { c?.queryItems = [URLQueryItem(name: "lang", value: lang)] }
+        return c?.url
+    }
+
+    /// HTTP request headers the add-on declares this stream NEEDS (behaviorHints.proxyHeaders):
+    /// some add-ons front CDNs that reject requests without a specific Referer or browser
+    /// User-Agent. Official clients apply these; the player must too or the stream 403s.
+    var requestHeaders: [String: String]? {
+        guard let headers = behaviorHints?.proxyHeaders?.request, !headers.isEmpty else { return nil }
+        return headers
+    }
+}
+
+struct CoreStreamBehaviorHints: Decodable, Equatable {
+    let notWebReady: Bool?
+    let bingeGroup: String?
+    let filename: String?
+    let proxyHeaders: CoreProxyHeaders?
+}
+
+/// `behaviorHints.proxyHeaders`: per-stream HTTP headers, `request` applied on the way out.
+struct CoreProxyHeaders: Decodable, Equatable {
+    let request: [String: String]?
+}
+
+/// Streams grouped by source addon, for the per-addon filter + source labels.
+struct CoreStreamSourceGroup: Identifiable, Equatable {
+    let id: String
+    let addon: String
+    let streams: [CoreStream]
+}
+
+// MARK: discover (catalog_with_filters)
+
+struct CoreDiscover: Decodable {
+    let selectable: CoreDiscoverSelectable
+    let catalog: [CoreCatalogPage]          // Vec<ResourceLoadable<Vec<MetaItemPreview>>> (pages)
+    var items: [CoreMeta] { catalog.compactMap { $0.content?.ready }.flatMap { $0 } }
+    /// True while any catalog page is still loading (e.g. a just-dispatched next-page request). Lets the
+    /// bridge tell a mid-load emit (same item count, more coming) apart from a settled end-of-catalog
+    /// (load finished with no new items), so cursorless-pagination end-detection never latches early.
+    var isLoadingPage: Bool { catalog.contains { $0.content?.isLoading == true } }
+}
+
+struct CoreDiscoverSelectable: Decodable {
+    let types: [CoreSelectableType]
+    let catalogs: [CoreSelectableCatalog]
+    let extra: [CoreSelectableExtra]
+    /// Present when the current catalog has another page (the engine's skip-based pagination); nil at
+    /// the end. Drives Discover's infinite scroll via `CoreBridge.loadDiscoverNextPage()`.
+    let nextPage: CoreSelectablePage?
+
+    enum CodingKeys: String, CodingKey {
+        case types, catalogs, extra
+        case nextPage = "next_page"
+    }
+}
+
+/// The engine's `SelectablePage` (catalog_with_filters): carries the request for the next page.
+struct CoreSelectablePage: Decodable {
+    let request: CoreRequest
+}
+
+struct CoreSelectableType: Decodable, Identifiable {
+    let type: String
+    let selected: Bool
+    let request: CoreRequest
+    var id: String { type }
+}
+
+struct CoreSelectableCatalog: Decodable, Identifiable {
+    let catalog: String
+    let selected: Bool
+    let request: CoreRequest
+    var id: String { "\(catalog)|\(request.path.id)|\(request.path.type)" }
+}
+
+struct CoreSelectableExtra: Decodable {
+    let name: String
+    let options: [CoreSelectableExtraOption]
+}
+
+struct CoreSelectableExtraOption: Decodable, Identifiable {
+    let value: String?
+    let selected: Bool
+    let request: CoreRequest
+    var id: String { value ?? "·all·" }
+    var label: String { value ?? "All" }
+}
+
+// MARK: library (library_with_filters)
+
+struct CoreLibrary: Decodable {
+    let selectable: CoreLibrarySelectable
+    let catalog: [CoreCWItem]               // Vec<LibraryItem> (already sorted/filtered/paginated)
+}
+
+struct CoreLibrarySelectable: Decodable {
+    let types: [CoreLibType]
+    let sorts: [CoreLibSort]
+}
+
+struct CoreLibType: Decodable, Identifiable {
+    let type: String?
+    let selected: Bool
+    let request: CoreLibraryRequest
+    var id: String { type ?? "·all·" }
+    var label: String { type?.capitalized ?? "All" }
+}
+
+struct CoreLibSort: Decodable, Identifiable {
+    let sort: String
+    let selected: Bool
+    let request: CoreLibraryRequest
+    var id: String { sort }
+    var label: String {
+        switch sort {
+        case "lastwatched": return "Recent"
+        case "name": return "Name A–Z"
+        case "namereverse": return "Name Z–A"
+        case "timeswatched": return "Most watched"
+        case "watched": return "Watched"
+        case "notwatched": return "Unwatched"
+        default: return sort.capitalized
+        }
+    }
+}
+
+// MARK: round-trippable requests, decoded from `selectable`, re-encoded to dispatch a selection
+
+struct CoreRequest: Codable, Hashable {
+    let base: String
+    let path: CoreRequestPath
+}
+
+struct CoreRequestPath: Codable, Hashable {
+    let resource: String
+    let type: String
+    let id: String
+    let extra: [[String]]   // [["genre","Action"], …], array of pairs, not objects
+}
+
+struct CoreLibraryRequest: Codable, Hashable {
+    let type: String?
+    let sort: String
+    let page: Int
+}
+
+// MARK: - Noiro account-owned add-on (sync doc)
+
+/// A full add-on descriptor the Noiro account OWNS, stored plaintext in `doc.noiro.addons` so the
+/// engine can be re-hydrated network-free when a Stremio session is absent/degraded (the "0 sources /
+/// 0 add-ons" fix). The shape mirrors the engine's `InstallAddon` descriptor (`{transportUrl, manifest,
+/// flags}`) so a re-dispatch is byte-shape-exact, plus `name` for the dashboard. `manifest`/`flags`
+/// are kept as opaque JSON passthrough so the descriptor round-trips into the engine unchanged without
+/// this layer needing to model the whole Stremio manifest schema. Only descriptors enter the doc (the
+/// Stremio token stays Keychain-only); these already ride `doc.addons` + `apiKeys` E2E today.
+struct NoiroOwnedAddon {
+    let transportUrl: String
+    let name: String
+    let manifest: [String: Any]   // opaque passthrough, re-dispatched verbatim to the engine
+    let flags: [String: Any]?
+
+    /// Build from one `doc.noiro.addons` (or `doc.addons`) entry. Tolerates the legacy
+    /// `{transportUrl,name}`-only shape (manifest absent) by skipping it: without a manifest the engine
+    /// cannot InstallAddon, so it is not hydratable and is dropped rather than dispatched as a no-op.
+    init?(json: [String: Any]) {
+        guard let url = json["transportUrl"] as? String, !url.isEmpty,
+              let manifest = json["manifest"] as? [String: Any] else { return nil }
+        self.transportUrl = url
+        self.manifest = manifest
+        self.flags = json["flags"] as? [String: Any]
+        self.name = (json["name"] as? String) ?? (manifest["name"] as? String) ?? url
+    }
+
+    /// The exact `InstallAddon` descriptor the engine expects (`installAddon` sends the same shape).
+    /// Keys are camelCase to match the engine's serde contract; a lowercase-key mismatch silently
+    /// no-ops in the engine, so this MUST stay aligned with CoreBridge.installAddon.
+    var installDescriptor: [String: Any] {
+        var d: [String: Any] = ["transportUrl": transportUrl, "manifest": manifest]
+        d["flags"] = flags ?? ["official": false, "protected": false]
+        return d
+    }
+}
+
+// MARK: - Stremio mirror settings (owner-requested per-category control)
+
+/// Per-category control of whether Noiro mirrors a live Stremio account.
+///
+/// DEFAULT OFF for every category = the FLOOR: Noiro owns the category. Snapshot-on-import seeds it
+/// once, hydrate-from-doc keeps it alive, and a Stremio removal NEVER removes it from Noiro.
+///
+/// ON = EXACT MIRROR for that category: on a SUCCESSFUL Stremio reconcile the Noiro-owned set for the
+/// category is replaced to match the live Stremio set (adds AND removes tracked).
+///
+/// The never-zero guard is independent of these toggles: a failed/absent/empty Stremio pull is ignored
+/// and never zeroes a category. Hydrate-from-doc is also NOT gated by the toggles. The toggles only
+/// control the snapshot/mirror DIRECTION (Stremio -> Noiro) and whether Stremio removals propagate.
+///
+/// Stored in UserDefaults so the flags ride the SettingsBackup blob (doc.settings) and sync across
+/// devices.
+enum MirrorSettings {
+    static let addonsKey = "noiro.sync.mirror.addons"
+    static let libraryKey = "noiro.sync.mirror.library"
+    static let continueWatchingKey = "noiro.sync.mirror.cw"
+
+    /// Mirror add-ons from Stremio (default OFF = Noiro keeps its own add-on set).
+    static var mirrorAddons: Bool { UserDefaults.standard.bool(forKey: addonsKey) }
+    /// Mirror library from Stremio (default OFF = Noiro keeps its own library).
+    static var mirrorLibrary: Bool { UserDefaults.standard.bool(forKey: libraryKey) }
+    /// Mirror Continue Watching from Stremio (default OFF = Noiro keeps its own CW).
+    static var mirrorContinueWatching: Bool { UserDefaults.standard.bool(forKey: continueWatchingKey) }
+}
+
+// MARK: - HDHomeRun local Live TV
+
+/// The small HTTP surface exposed by an HDHomeRun tuner. Keeping this in the shared layer means the
+/// discovered tuner and lineup can be reused by every Apple surface without involving Stremio add-ons.
+struct HDHomeRunDevice: Codable, Identifiable, Hashable {
+    let friendlyName: String
+    let modelNumber: String?
+    let deviceID: String
+    let deviceAuth: String?
+    let baseURL: String
+    let lineupURL: String
+    let tunerCount: Int?
+
+    var id: String { deviceID }
+
+    private enum CodingKeys: String, CodingKey {
+        case friendlyName = "FriendlyName"
+        case modelNumber = "ModelNumber"
+        case deviceID = "DeviceID"
+        case deviceAuth = "DeviceAuth"
+        case baseURL = "BaseURL"
+        case lineupURL = "LineupURL"
+        case tunerCount = "TunerCount"
+    }
+}
+
+struct HDHomeRunProgram: Codable, Hashable {
+    let guideNumber: String
+    let title: String
+    let subtitle: String?
+    let summary: String?
+    let category: String?
+    let imageURL: String?
+    let channelImageURL: String?
+    let start: Date
+    let end: Date
+
+    var progress: Double {
+        let duration = end.timeIntervalSince(start)
+        guard duration > 0 else { return 0 }
+        return min(max(Date().timeIntervalSince(start) / duration, 0), 1)
+    }
+}
+
+struct HDHomeRunChannel: Codable, Identifiable, Hashable {
+    let guideNumber: String
+    let guideName: String
+    let streamURL: String
+    let isHD: Bool
+    let isFavorite: Bool
+    let isDRM: Bool
+
+    var id: String { "\(guideNumber)|\(streamURL)" }
+
+    private enum CodingKeys: String, CodingKey {
+        case guideNumber = "GuideNumber"
+        case guideName = "GuideName"
+        case streamURL = "URL"
+        case isHD = "HD"
+        case isFavorite = "Favorite"
+        case isDRM = "DRM"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func flag(_ key: CodingKeys) -> Bool {
+            if let value = try? c.decode(Bool.self, forKey: key) { return value }
+            if let value = try? c.decode(Int.self, forKey: key) { return value != 0 }
+            if let value = try? c.decode(String.self, forKey: key) {
+                return value == "1" || value.lowercased() == "true"
+            }
+            return false
+        }
+        guideNumber = try c.decode(String.self, forKey: .guideNumber)
+        guideName = try c.decode(String.self, forKey: .guideName)
+        streamURL = try c.decode(String.self, forKey: .streamURL)
+        isHD = flag(.isHD)
+        isFavorite = flag(.isFavorite)
+        isDRM = flag(.isDRM)
+    }
+}
+
+/// Discovers a tuner through its standard local hostname, validates `/discover.json`, then loads the
+/// device's `/lineup.json`. A manual hostname/IP is retained as a reliable fallback for routers that do
+/// not publish `.local` names. The last good device and lineup are cached so Live TV opens immediately.
+@MainActor
+final class HDHomeRunManager: ObservableObject {
+    static let shared = HDHomeRunManager()
+
+    static let enabledKey = "noiro.hdhomerun.enabled"
+    static let addressKey = "noiro.hdhomerun.address"
+    static let guideEmailKey = "noiro.hdhomerun.guideEmail"
+    private static let deviceKey = "noiro.hdhomerun.device"
+    private static let channelsKey = "noiro.hdhomerun.channels"
+    private static let programsKey = "noiro.hdhomerun.programs"
+
+    @Published var enabled: Bool {
+        didSet { UserDefaults.standard.set(enabled, forKey: Self.enabledKey) }
+    }
+    @Published var address: String {
+        didSet { UserDefaults.standard.set(address, forKey: Self.addressKey) }
+    }
+    @Published var guideEmail: String {
+        didSet { UserDefaults.standard.set(guideEmail, forKey: Self.guideEmailKey) }
+    }
+    @Published private(set) var device: HDHomeRunDevice?
+    @Published private(set) var channels: [HDHomeRunChannel] = []
+    @Published private(set) var currentPrograms: [String: HDHomeRunProgram] = [:]
+    @Published private(set) var guidePrograms: [String: [HDHomeRunProgram]] = [:]
+    @Published private(set) var isDiscovering = false
+    @Published private(set) var status = "Not configured"
+
+    private init() {
+        let defaults = UserDefaults.standard
+        enabled = defaults.object(forKey: Self.enabledKey) as? Bool ?? false
+        address = defaults.string(forKey: Self.addressKey) ?? ""
+        guideEmail = defaults.string(forKey: Self.guideEmailKey) ?? ""
+        if let data = defaults.data(forKey: Self.deviceKey) {
+            device = try? JSONDecoder().decode(HDHomeRunDevice.self, from: data)
+        }
+        if let data = defaults.data(forKey: Self.channelsKey) {
+            channels = (try? JSONDecoder().decode([HDHomeRunChannel].self, from: data)) ?? []
+        }
+        if let data = defaults.data(forKey: Self.programsKey) {
+            currentPrograms = (try? JSONDecoder().decode([String: HDHomeRunProgram].self, from: data)) ?? [:]
+        }
+        if let device {
+            status = channels.isEmpty
+                ? "Connected to \(device.friendlyName)"
+                : "\(device.friendlyName) · \(channels.count) channels"
+        }
+    }
+
+    /// Discover the tuner on the LAN. The well-known `.local` endpoint is tried first, followed by the
+    /// optional address entered in Settings. Both paths are verified by decoding the device document.
+    func discover() async {
+        guard !isDiscovering else { return }
+        isDiscovering = true
+        status = "Looking on your network…"
+        defer { isDiscovering = false }
+
+        var candidates = ["http://hdhomerun.local"]
+        if !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            candidates.insert(address, at: 0)
+        }
+
+        for candidate in candidates {
+            do {
+                let found = try await probe(candidate)
+                device = found
+                address = found.baseURL
+                try cache(found, key: Self.deviceKey)
+                await refreshChannels()
+                return
+            } catch { }
+        }
+
+        status = "No HDHomeRun found. Enter its IP address and try again."
+    }
+
+    func refreshChannels() async {
+        guard let device, let url = URL(string: device.lineupURL) else {
+            status = "Discover a tuner first."
+            return
+        }
+        isDiscovering = true
+        status = "Refreshing channel lineup…"
+        defer { isDiscovering = false }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 8
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+            let decoded = try JSONDecoder().decode([HDHomeRunChannel].self, from: data)
+            channels = decoded.filter { !$0.isDRM && URL(string: $0.streamURL) != nil }
+                .sorted { Self.channelOrder($0.guideNumber, $1.guideNumber) }
+            try cache(channels, key: Self.channelsKey)
+            enabled = true
+            await refreshGuide()
+            if currentPrograms.isEmpty {
+                status = "\(device.friendlyName) · \(channels.count) channels · guide unavailable"
+            } else {
+                status = "\(device.friendlyName) · \(channels.count) channels · guide updated"
+            }
+        } catch {
+            status = "Tuner found, but its channel lineup could not be loaded."
+        }
+    }
+
+    /// Load the official XMLTV guide using the tuner's rotating DeviceAuth. Newer guide accounts can
+    /// alternatively use their account email plus this tuner's DeviceID. XMLTV carries current show
+    /// titles, descriptions, times, categories and image URLs used by the Live cards and hero.
+    func refreshGuide() async {
+        guard var guideDevice = device else { return }
+        // DeviceAuth rotates throughout the day; always re-read discover.json immediately before a
+        // guide request instead of trusting the cached discovery document.
+        if let refreshed = try? await probe(guideDevice.baseURL) {
+            guideDevice = refreshed
+            device = refreshed
+            try? cache(refreshed, key: Self.deviceKey)
+        }
+        var components = URLComponents(string: "https://api.hdhomerun.com/api/xmltv")!
+        if let auth = guideDevice.deviceAuth, !auth.isEmpty {
+            components.queryItems = [URLQueryItem(name: "DeviceAuth", value: auth)]
+        } else if !guideEmail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            components.queryItems = [
+                URLQueryItem(name: "Email", value: guideEmail.trimmingCharacters(in: .whitespacesAndNewlines)),
+                URLQueryItem(name: "DeviceIDs", value: guideDevice.deviceID)
+            ]
+        } else {
+            currentPrograms = [:]
+            return
+        }
+        guard let url = components.url else { return }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 15
+            request.setValue("gzip", forHTTPHeaderField: "Accept-Encoding")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.userAuthenticationRequired) }
+            let parser = HDHomeRunXMLTVParser(data: data)
+            let programs = try parser.parse()
+            let now = Date()
+            let guideEnd = now.addingTimeInterval(6 * 60 * 60)
+            guidePrograms = Dictionary(grouping: programs.filter { $0.end > now && $0.start < guideEnd },
+                                       by: \.guideNumber)
+                .mapValues { $0.sorted { $0.start < $1.start } }
+            var current: [String: HDHomeRunProgram] = [:]
+            for program in programs where program.start <= now && program.end > now {
+                current[program.guideNumber] = program
+            }
+            currentPrograms = current
+            try cache(currentPrograms, key: Self.programsKey)
+        } catch {
+            // Keep the last good guide through a transient network or account failure.
+        }
+    }
+
+    func clear() {
+        enabled = false
+        address = ""
+        device = nil
+        channels = []
+        currentPrograms = [:]
+        guidePrograms = [:]
+        status = "Not configured"
+        UserDefaults.standard.removeObject(forKey: Self.deviceKey)
+        UserDefaults.standard.removeObject(forKey: Self.channelsKey)
+        UserDefaults.standard.removeObject(forKey: Self.programsKey)
+    }
+
+    private func probe(_ rawAddress: String) async throws -> HDHomeRunDevice {
+        var value = rawAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !value.contains("://") { value = "http://\(value)" }
+        guard var components = URLComponents(string: value) else { throw URLError(.badURL) }
+        components.path = "/discover.json"
+        components.query = nil
+        guard let url = components.url else { throw URLError(.badURL) }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 4
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+        return try JSONDecoder().decode(HDHomeRunDevice.self, from: data)
+    }
+
+    private func cache<T: Encodable>(_ value: T, key: String) throws {
+        UserDefaults.standard.set(try JSONEncoder().encode(value), forKey: key)
+    }
+
+    private static func channelOrder(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.compare(rhs, options: .numeric) == .orderedAscending
+    }
+}
+
+private final class HDHomeRunXMLTVParser: NSObject, XMLParserDelegate {
+    private let data: Data
+    private var channelNumbers: [String: String] = [:]
+    private var channelImages: [String: String] = [:]
+    private var parsedPrograms: [HDHomeRunProgram] = []
+    private var channelID: String?
+    private var channelLCN: String?
+    private var channelDisplayNames: [String] = []
+    private var channelIcon: String?
+    private var program: ProgramBuilder?
+    private var text = ""
+
+    init(data: Data) { self.data = data }
+
+    func parse() throws -> [HDHomeRunProgram] {
+        let parser = XMLParser(data: data)
+        parser.delegate = self
+        guard parser.parse() else { throw parser.parserError ?? URLError(.cannotParseResponse) }
+        return parsedPrograms
+    }
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+                qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
+        text = ""
+        switch elementName {
+        case "channel":
+            channelID = attributeDict["id"]
+            channelLCN = nil
+            channelDisplayNames = []
+            channelIcon = nil
+        case "programme":
+            guard let start = Self.date(attributeDict["start"]), let end = Self.date(attributeDict["stop"]),
+                  let channel = attributeDict["channel"] else { return }
+            program = ProgramBuilder(channelID: channel, start: start, end: end)
+        case "icon":
+            if program != nil { program?.imageURL = attributeDict["src"] }
+            else { channelIcon = attributeDict["src"] }
+        default: break
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) { text += string }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if program != nil {
+            switch elementName {
+            case "title": program?.title = value
+            case "sub-title": program?.subtitle = value
+            case "desc": program?.summary = value
+            case "category": if program?.category == nil { program?.category = value }
+            case "series-id": program?.seriesID = value
+            case "programme":
+                if let p = program, let guideNumber = channelNumbers[p.channelID], !p.title.isEmpty {
+                    let titleImage = p.imageURL ?? p.seriesID.flatMap {
+                        $0.isEmpty ? nil : "https://img.hdhomerun.com/titles/\($0).jpg"
+                    }
+                    parsedPrograms.append(HDHomeRunProgram(guideNumber: guideNumber, title: p.title,
+                        subtitle: p.subtitle, summary: p.summary, category: p.category,
+                        imageURL: titleImage, channelImageURL: channelImages[p.channelID],
+                        start: p.start, end: p.end))
+                }
+                program = nil
+            default: break
+            }
+        } else {
+            switch elementName {
+            case "lcn": channelLCN = value
+            case "display-name": channelDisplayNames.append(value)
+            case "channel":
+                if let id = channelID {
+                    let fallback = channelDisplayNames.first { $0.range(of: #"^\d+(\.\d+)?$"#, options: .regularExpression) != nil }
+                    if let number = channelLCN ?? fallback { channelNumbers[id] = number }
+                    if let channelIcon { channelImages[id] = channelIcon }
+                }
+                channelID = nil
+            default: break
+            }
+        }
+        text = ""
+    }
+
+    private final class ProgramBuilder {
+        let channelID: String
+        let start: Date
+        let end: Date
+        var title = ""
+        var subtitle: String?
+        var summary: String?
+        var category: String?
+        var imageURL: String?
+        var seriesID: String?
+        init(channelID: String, start: Date, end: Date) {
+            self.channelID = channelID; self.start = start; self.end = end
+        }
+    }
+
+    private static func date(_ raw: String?) -> Date? {
+        guard let raw else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMddHHmmss Z"
+        return formatter.date(from: raw)
+    }
+}
