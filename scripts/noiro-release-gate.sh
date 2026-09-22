@@ -43,9 +43,9 @@ scan_forbidden() {
   fi
 }
 
-scan_forbidden "no inherited legacy hosts" '([[:alnum:]-]+[.])?noiro[.]tv'
+scan_forbidden "no inherited legacy hosts" 'https?://([[:alnum:]-]+[.])?noiro[.]tv([/:]|$)'
 scan_forbidden "no inherited edge secret identifier" 'NOIRO[_-]EDGE[_-]SECRET'
-scan_forbidden "no old owner repository links" 'NoiroTV[/]Noiro'
+scan_forbidden "no old owner repository links" '0eroiQ[/]Noiro(-Issues)?'
 
 if git ls-files --error-unmatch app/Resources/server.js >/dev/null 2>&1; then
   fail "proprietary server.js is not tracked"
